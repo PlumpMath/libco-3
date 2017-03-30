@@ -41,41 +41,7 @@ int main()
 {
 	auto* scheduler = libco::CreateScheduler();
 
-	for (int i = 0 ; i < 10000; i++)
-	{
-		bool ok = scheduler->NewTask([](auto* task) {
-			
-		});
-		if (!ok)
-		{
-			try
-			{
-				std::thread([] {
-					auto* scheduler = libco::CreateScheduler();
-
-					for (int i = 0; i < 10000; i++)
-					{
-						bool ok = scheduler->NewTask([](auto* task) {
-
-						});
-
-						if (!ok)
-						{
-							GetTickCount();
-						}
-					}
-				}).join();
-			}
-			catch (std::system_error& e)
-			{
-				GetTickCount();
-			}
-			
-		}
-	}
-
-
-
-    return 0;
+	scheduler->Delete();
+    return 0; 
 }
 
