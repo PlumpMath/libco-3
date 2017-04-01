@@ -18,4 +18,4 @@ scheduler->Peek();
 scheduler->Delete();
 ```
 
-for now, ```ITask``` only have one api, more in the future.
+for now, ```ITask``` support most socket api.

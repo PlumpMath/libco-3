@@ -37,25 +37,60 @@ void sample_nesting()
 	scheduler->Delete();
 }
 
+void tcp_server_responder(libco::ITask* task, SOCKET sock)
+{
+	char buf[256];
+
+	while (true)
+	{
+		int n = task->recv(sock, buf, 256);
+
+		if (n > 0)
+		{
+			task->send(sock, buf, n);
+		}
+		else
+		{
+			break;
+		}
+	}
+	task->closesocket(sock);
+}
+
+void tcp_server(libco::ITask* task)
+{
+	int err;
+	SOCKET server;
+	sockaddr_in dest;
+
+	server = task->socket(AF_INET);
+	err = uv_ip4_addr("127.0.0.1", 6666, &dest);
+	err = task->bind(server, (sockaddr*)&dest, sizeof(dest));
+	err = task->listen(server, 100000);
+
+	while (true)
+	{
+		SOCKET cli = task->accept(server, nullptr, nullptr);
+
+		if (cli != INVALID_SOCKET)
+		{
+			task->GetOwner()->NewTask(std::bind(tcp_server_responder, std::placeholders::_1, cli));
+		}
+		else
+		{
+			break;
+		}
+	}
+	task->closesocket(server);
+}
+
 int main()
 {
 	auto* scheduler = libco::CreateScheduler();
 
-	scheduler->NewTask([](libco::ITask* task) {
-		int err;
-		SOCKET sock;
-		sockaddr_in dest;
-		sock = task->socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+	scheduler->NewTask(tcp_server);
 
-		err = uv_ip4_addr("127.0.0.1", 3333, &dest);
-		err = task->connect(sock, (sockaddr*)&dest, sizeof(dest));
-		err = task->send(sock, "lll", 3, 0);
-		char rrr[32] = {0};
-		err = task->recv(sock, rrr, 32, 0);
-
-		task->closesocket(sock);
-	});
-
+	scheduler->Peek();
 	scheduler->Delete();
     return 0; 
 }

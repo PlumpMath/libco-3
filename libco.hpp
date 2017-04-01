@@ -17,19 +17,17 @@ namespace libco
 	public:
 		virtual IScheduler* GetOwner() = 0;
 	public: // basic
-		virtual void Sleep(std::uint64_t ms) = 0;
-	public: // Berkeley socket
-		virtual uv_os_sock_t socket(int af, int type, int protocol) = 0;
+		virtual bool Sleep(std::uint64_t ms) = 0;
+	public: // socket
+		virtual uv_os_sock_t socket(int af, int type = SOCK_STREAM, int protocol = IPPROTO_TCP) = 0;
 		virtual int closesocket(uv_os_sock_t s) = 0;
 		virtual int connect(uv_os_sock_t s, const struct sockaddr* name, int namelen) = 0;
-		virtual int send(uv_os_sock_t s, const char* buf, int len, int flags = 0) = 0;
-		virtual int recv(uv_os_sock_t s, char* buf, int len, int flags = 0) = 0;
-		/*
+		virtual int send(uv_os_sock_t s, const char* buf, int len) = 0;
+		virtual int recv(uv_os_sock_t s, char* buf, int len) = 0;
+		virtual int shutdown(uv_os_sock_t s) = 0;
 		virtual int bind(uv_os_sock_t s, const struct sockaddr* addr, int namelen) = 0;
 		virtual int listen(uv_os_sock_t s, int backlog) = 0;
 		virtual uv_os_sock_t accept(uv_os_sock_t s, struct sockaddr* addr, int* addrlen) = 0;
-		virtual int shutdown(uv_os_sock_t s, int how) = 0;
-	*/
 	};
 
 	class IScheduler
@@ -48,23 +46,16 @@ namespace libco
 		using FIBER_T = LPVOID;
 
 		template<typename _Tn> void MemFree(_Tn* ptr) { free(ptr); }
-		template<class _Tc, typename _Tn> _Tc* MemAlloc(_Tn size) { return (_Tc*)malloc(size); }
-
-		uv_handle_t* MemAllocHandle(uv_handle_type type)
+		template<class _Tc, typename _Tn> _Tc* MemAlloc(_Tn size)
 		{
-			assert(type > UV_UNKNOWN_HANDLE);
-			assert(type < UV_HANDLE_TYPE_MAX);
+			_Tc* ptr = (_Tc*)malloc(size);
 
-			uv_handle_t* handle;
-			auto hsize = uv_handle_size(type);
-			assert(hsize > 0);
-			handle = MemAlloc<uv_handle_t>(hsize);
-			if (handle == nullptr)
+			if (ptr == nullptr)
 			{
-				throw std::runtime_error("Alloc uv handle error");
+				throw std::runtime_error("Allocate memory error");
 			}
-			memset(handle, 0x00, hsize);
-			return handle;
+			memset(ptr, 0x00, size);
+			return ptr;
 		}
 
 		class CXHandle
@@ -76,12 +67,18 @@ namespace libco
 			}
 			CXHandle(const CXHandle& other)
 			{
+				assert(other.m_handle != nullptr);
+				assert(other.m_handle->data != nullptr);
+
 				m_handle = other.m_handle;
 			}
 			CXHandle& operator=(const CXHandle& other)
 			{
 				if (this != &other)
 				{
+					assert(other.m_handle != nullptr);
+					assert(other.m_handle->data != nullptr);
+
 					m_handle = other.m_handle;
 				}
 				return *this;
@@ -90,6 +87,7 @@ namespace libco
 			CXHandle(_Tn* any_handle)
 			{
 				assert(any_handle != nullptr);
+				assert(any_handle->data != nullptr);
 				assert(typeid(any_handle->type) == typeid(uv_handle_type));
 				assert(any_handle->type > UV_UNKNOWN_HANDLE);
 				assert(any_handle->type < UV_HANDLE_TYPE_MAX);
@@ -103,7 +101,7 @@ namespace libco
 				assert(type > UV_UNKNOWN_HANDLE);
 				assert(type < UV_HANDLE_TYPE_MAX);
 
-				m_handle = MemAllocHandle(type);
+				m_handle = AllocHandle(type);
 
 				switch (type)
 				{
@@ -113,17 +111,13 @@ namespace libco
 				case UV_TCP:
 					errcode = uv_tcp_init(loop, *this);
 					break;
-				case UV_UDP:
-					errcode = uv_udp_init(loop, *this);
-					break;
 				default:
 					throw std::invalid_argument("Unsupported uv handle type");
 					break;
 				}
 				if (errcode != 0)
 				{
-					MemFree(m_handle);
-					m_handle = nullptr;
+					FreeHandle(m_handle);
 					throw std::runtime_error("Init uv handle error");
 				}
 			}
@@ -136,28 +130,100 @@ namespace libco
 
 				// make sure cast to a uv handle
 				assert(any_handle != nullptr);
+				assert(any_handle->data != nullptr);
 				assert(typeid(any_handle->type) == typeid(uv_handle_type));
 				return any_handle;
+			}
+		protected:
+			typedef struct
+			{
+				IXTask* owner;
+				void* exclude; // only one task can use it in the same time
+			}HCONTEXT;
+			static void FreeHandle(uv_handle_t* handle)
+			{
+				CXHandle Handle(handle);
+				auto* hctx = Handle.GetHandleContext();
+
+				if (hctx->exclude != nullptr)
+				{
+					MemFree(hctx->exclude);
+				}
+				MemFree(hctx);
+				MemFree(handle);
+			}
+			static uv_handle_t* AllocHandle(uv_handle_type type)
+			{
+				assert(type > UV_UNKNOWN_HANDLE);
+				assert(type < UV_HANDLE_TYPE_MAX);
+
+				auto hsize = uv_handle_size(type);
+				assert(hsize > 0);
+				uv_handle_t* handle = MemAlloc<uv_handle_t>(hsize);
+				handle->data = MemAlloc<HCONTEXT>(sizeof(HCONTEXT));
+				return handle;
+			}
+			HCONTEXT* GetHandleContext()
+			{
+				assert(m_handle != nullptr);
+				assert(m_handle->data != nullptr);
+
+				return (HCONTEXT*)m_handle->data;
 			}
 		public:
 			void Close()
 			{
 				assert(m_handle != nullptr);
 
-				uv_close(m_handle, [](uv_handle_t* handle) { MemFree(handle); });
+				uv_close(m_handle, [](uv_handle_t* handle) { FreeHandle(handle); });
 			}
+		public: // handle's owner
 			IXTask* GetXTask()
 			{
-				assert(m_handle != nullptr);
-				assert(m_handle->data != nullptr);
+				auto* ctx = GetHandleContext();
 
-				return (IXTask*)m_handle->data;
+				assert(ctx->owner != nullptr);
+				return ctx->owner;
 			}
 			void SetXTask(IXTask* task)
 			{
-				assert(m_handle != nullptr);
+				auto* ctx = GetHandleContext();
 
-				m_handle->data = task;
+				assert(ctx->owner == nullptr);
+				ctx->owner = task;
+			}
+		public: // only for socket handle
+			template<class _Tn>
+			_Tn* GetExclude()
+			{
+				assert(m_handle->type == UV_TCP);
+
+				auto* ctx = GetHandleContext();
+
+				assert(ctx->exclude != nullptr);
+				return (_Tn*)ctx->exclude;
+			}
+			bool SetExclude(void* object)
+			{
+				assert(m_handle->type == UV_TCP);
+
+				bool ok;
+				auto* ctx = GetHandleContext();
+
+				// only one task can recv in the same time
+				if (ok = (ctx->exclude == nullptr))
+				{
+					ctx->exclude = object;
+				}
+				return ok;
+			}
+			void ResetExclude()
+			{
+				assert(m_handle->type == UV_TCP);
+
+				auto* ctx = GetHandleContext();
+
+				ctx->exclude = nullptr;
 			}
 		private:
 			uv_handle_t* m_handle;
@@ -180,10 +246,10 @@ namespace libco
 			virtual FIBER_T GetFiber() const = 0;
 			virtual uv_loop_t* GetLoopContext() const = 0;
 		public: // socket register
-			virtual int DeleteSocket(uv_os_sock_t s) = 0;
-			virtual bool QuerySocket(uv_os_sock_t s, uv_tcp_t*& handle) = 0;
-			virtual bool QuerySocket(uv_os_sock_t s, uv_udp_t*& handle) = 0;
-			virtual uv_os_sock_t CreateSocket(int af, int type, int protocol) = 0;
+			virtual uv_os_sock_t CreateTcpSocket(int af) = 0;
+			virtual bool AttachTcpSocket(uv_os_sock_t s, uv_tcp_t* uv_handle = nullptr) = 0;
+			virtual bool DetachTcpSocket(uv_os_sock_t s) = 0;
+			virtual uv_tcp_t* QueryTcpSocket(uv_os_sock_t s) = 0;
 		};
 
 		class CXTask : public IXTask
@@ -231,147 +297,280 @@ namespace libco
 			virtual IScheduler* GetOwner() override { return m_owner; }
 			virtual IXScheduler* GetXOwner() const override { return m_owner; }
 		public:
-			virtual void Sleep(std::uint64_t ms) override
+			virtual bool Sleep(std::uint64_t ms) override
 			{
 				CXHandle sleep_handle(GetXOwner()->GetLoopContext(), UV_TIMER);
 
 				sleep_handle.SetXTask(this);
-				if (uv_timer_start(sleep_handle, _sleep_finished, ms, 0) != 0)
-				{
-					throw std::runtime_error("sleep error");
-				}
-				// switch to Scheduler
-				SwitchToFiber(GetXOwner()->GetFiber());
-				// come back, oh yeah !!!
-				sleep_handle.Close();
-			}
-			static void _sleep_finished(uv_timer_t* handle)
-			{
-				CXHandle Handle(handle);
-				IXTask* task = Handle.GetXTask();
+				int errcode = uv_timer_start(sleep_handle, [](uv_timer_t* handle) {
+					CXHandle Handle(handle);
+					IXTask* task = Handle.GetXTask();
 
-				// back to task
-				SwitchToFiber(task->GetFiber());
+					// back to task
+					SwitchToFiber(task->GetFiber());
+				}, ms, 0);
+				if (errcode == 0)
+				{
+					// switch to Scheduler
+					SwitchToFiber(GetXOwner()->GetFiber());
+					// come back, oh yeah !!!
+				}
+				sleep_handle.Close();
+				return (errcode == 0);
 			}
+		protected: // socket io struct ext
+			enum uv_exclude_type { uv_exclude_none, uv_exclude_recv, uv_exclude_listen };
+			struct uv_exclude_ext { uv_exclude_type type; };
+			struct uv_conn_ext : uv_connect_t { IXTask* task; int status; };
+			struct uv_send_ext : uv_write_t { IXTask* task; int status; };
+			struct uv_recv_ext : uv_exclude_ext { IXTask* task; char* buf; int len; ssize_t nread; };
+			struct uv_shutdown_ext : uv_shutdown_t { IXTask* task; int status; };
+			struct uv_listen_ext : uv_exclude_ext { IXTask* task; int last_status; int queue_count; };
 		public: // socket
 			virtual uv_os_sock_t socket(int af, int type, int protocol) override
 			{
-				return GetXOwner()->CreateSocket(af, type, protocol);
+				if (type == SOCK_STREAM)
+				{
+					if ((protocol == IPPROTO_TCP) || (protocol == 0))
+					{
+						return GetXOwner()->CreateTcpSocket(af);
+					}
+				}
+				return invalid_socket;
 			}
 			virtual int closesocket(uv_os_sock_t s) override
 			{
-				return GetXOwner()->DeleteSocket(s);
+				return GetXOwner()->DetachTcpSocket(s);
 			}
 			virtual int connect(uv_os_sock_t s, const struct sockaddr* name, int namelen) override
 			{
-				uv_tcp_t* tcp_handle;
-
-				m_cur_data.conn_data.status = -1;
+				int status = -1;
+				
 				assert(sizeof(struct sockaddr) == namelen);
-				if (GetXOwner()->QuerySocket(s, tcp_handle))
+				if (uv_tcp_t* tcp_handle = GetXOwner()->QueryTcpSocket(s))
 				{
-					uv_connect_t conn = { this };
+					int errcode;
+					uv_conn_ext reqx;
 
-					if (uv_tcp_connect(&conn, tcp_handle, name, _connect_finished) == 0)
+					reqx.task = this;
+					reqx.status = status;
+					errcode = uv_tcp_connect(&reqx, tcp_handle, name, [](uv_connect_t* req, int status) {
+						uv_conn_ext* reqx = (uv_conn_ext*)req;
+
+						reqx->status = status;
+						SwitchToFiber(reqx->task->GetFiber());
+					});
+					if (errcode == 0)
 					{
 						SwitchToFiber(GetXOwner()->GetFiber());
+						status = reqx.status;
 					}
 				}
-				return m_cur_data.conn_data.status;
+				return status;
 			}
-			virtual int send(uv_os_sock_t s, const char* buf, int len, int flags) override
+			virtual int send(uv_os_sock_t s, const char* buf, int len) override
 			{
-				uv_tcp_t* tcp_handle;
+				int status = -1;
 
-				m_cur_data.send_data.status = -1;
-				if (GetXOwner()->QuerySocket(s, tcp_handle))
+				if (uv_tcp_t* tcp_handle = GetXOwner()->QueryTcpSocket(s))
 				{
-					uv_write_t req = { this };
+					int errcode;
 					uv_buf_t uvbuf;
+					uv_send_ext reqx;
 
 					uvbuf.len = len;
 					uvbuf.base = (char*)buf;
-					if (uv_write(&req, (uv_stream_t*)tcp_handle, &uvbuf, 1, _send_finished) == 0)
+					reqx.task = this;
+					reqx.status = status;
+					errcode = uv_write(&reqx, (uv_stream_t*)tcp_handle, &uvbuf, 1, [](uv_write_t* req, int status) {
+						uv_send_ext* reqx = (uv_send_ext*)req;
+
+						reqx->status = status;
+						SwitchToFiber(reqx->task->GetFiber());
+					});
+					if (errcode == 0)
 					{
 						SwitchToFiber(GetXOwner()->GetFiber());
+						status = reqx.status;
 					}
 				}
-				return m_cur_data.send_data.status;
+				return status;
 			}
-			virtual int recv(uv_os_sock_t s, char* buf, int len, int flags) override
+			virtual int recv(uv_os_sock_t s, char* buf, int len) override
 			{
-				uv_tcp_t* tcp_handle;
+				int status = -1;
 
-				if (GetXOwner()->QuerySocket(s, tcp_handle))
+				if (uv_tcp_t* tcp_handle = GetXOwner()->QueryTcpSocket(s))
 				{
-					/*
-					m_cur_data.recv_data.buf = buf;
-					m_cur_data.recv_data.buf_size = len;
-					m_cur_data.recv_data.status = -1;
-					if (uv_read_start((uv_stream_t*)tcp_handle, _recv_alloc, _recv_finished) == 0)
+					uv_recv_ext reqx;
+					CXHandle Handle(tcp_handle);
+
+					reqx.type = uv_exclude_recv;
+					reqx.task = this;
+					reqx.buf = buf;
+					reqx.len = len;
+					reqx.nread = status;
+					if (Handle.SetExclude(&reqx))
+					{
+						int errcode = uv_read_start(Handle, [](uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf) {
+							CXHandle Handle(handle);
+							uv_recv_ext* reqx = Handle.GetExclude<uv_recv_ext>();
+
+							assert(reqx->type == uv_exclude_recv);
+							buf->base = reqx->buf;
+							buf->len = reqx->len;
+						}, [](uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf) {
+							CXHandle Handle(stream);
+							uv_recv_ext* reqx = Handle.GetExclude<uv_recv_ext>();
+
+							assert(reqx->type == uv_exclude_recv);
+							reqx->nread = nread;
+							uv_read_stop(Handle);
+							SwitchToFiber(reqx->task->GetFiber());
+						});
+						if (errcode == 0)
+						{
+							SwitchToFiber(GetXOwner()->GetFiber());
+							status = reqx.nread;
+						}
+						Handle.ResetExclude();
+					}
+				}
+				return status;
+			}
+			virtual int shutdown(uv_os_sock_t s) override
+			{
+				if (uv_tcp_t* tcp_handle = GetXOwner()->QueryTcpSocket(s))
+				{
+					uv_shutdown_ext reqx;
+
+					reqx.task = this;
+					reqx.status = -1;
+					int errcode = uv_shutdown(&reqx, CXHandle(tcp_handle), [](uv_shutdown_t* req, int status) {
+						uv_shutdown_ext* reqx = (uv_shutdown_ext*)req;
+
+						reqx->status = status;
+						SwitchToFiber(reqx->task->GetFiber());
+					});
+					if (errcode == 0)
 					{
 						SwitchToFiber(GetXOwner()->GetFiber());
+						errcode = reqx.status;
 					}
-					*/
+					return errcode;
 				}
-				return m_cur_data.recv_data.status;
+				return -1;
 			}
-		protected:
-			static void _connect_finished(uv_connect_t* req, int status)
+			virtual int bind(uv_os_sock_t s, const struct sockaddr* addr, int namelen) override
 			{
-				CXTask* task = (CXTask*)req->data;
-
-				task->m_cur_data.conn_data.status = status;
-				SwitchToFiber(task->GetFiber());
+				if (uv_tcp_t* tcp_handle = GetXOwner()->QueryTcpSocket(s))
+				{
+					return uv_tcp_bind(tcp_handle, addr, 0);
+				}
+				return -1;
 			}
-			static void _send_finished(uv_write_t* req, int status)
+			virtual int listen(uv_os_sock_t s, int backlog) override
 			{
-				CXTask* task = (CXTask*)req->data;
+				if (uv_tcp_t* tcp_handle = GetXOwner()->QueryTcpSocket(s))
+				{
+					CXHandle Handle(tcp_handle);
+					uv_listen_ext* reqx = MemAlloc<uv_listen_ext>(sizeof(uv_listen_ext));
 
-				task->m_cur_data.send_data.status = status;
-				SwitchToFiber(task->GetFiber());
+					reqx->type = uv_exclude_listen;
+					reqx->task = nullptr;
+					reqx->last_status = 0;
+					reqx->queue_count = 0;
+					if (Handle.SetExclude(reqx))
+					{
+						return uv_listen(Handle, backlog, [](uv_stream_t* server, int status) {
+							CXHandle Handle(server);
+							uv_listen_ext* reqx = Handle.GetExclude<uv_listen_ext>();
+
+							assert(reqx != nullptr);
+							if (reqx->type == uv_exclude_listen)
+							{
+								if (status == 0)
+								{
+									reqx->queue_count++;
+								}
+								reqx->last_status = status;
+								if (reqx->task != nullptr)
+								{
+									SwitchToFiber(reqx->task->GetFiber());
+								}
+							}
+							else
+							{
+								assert(false);
+							}
+						});
+					}
+				}
+				return -1;
 			}
-			static void _recv_alloc(uv_handle_t* handle, size_t suggested_size, uv_buf_t* buf)
+			virtual uv_os_sock_t accept(uv_os_sock_t s, struct sockaddr* addr, int* addrlen) override
 			{
-				/*
-				CXTask* task = (CXTask*)handle->data;
+				if (uv_tcp_t* tcp_handle = GetXOwner()->QueryTcpSocket(s))
+				{
+					CXHandle server(tcp_handle);
+					uv_listen_ext* reqx = server.GetExclude<uv_listen_ext>();
 
-				buf->base = task->m_cur_data.recv_data.buf;
-				buf->len = task->m_cur_data.recv_data.buf_size;
-				*/
-			}
-			static void _recv_finished(uv_stream_t* stream, ssize_t nread, const uv_buf_t* buf)
-			{
-				/*
-				CXTask* task = (CXTask*)stream->data;
+					auto _accept_stub = [this](CXHandle& server) -> uv_os_sock_t {
+						CXHandle client(GetXOwner()->GetLoopContext(), UV_TCP);
 
-				task->m_cur_data.recv_data.status = nread;
-				SwitchToFiber(task->GetFiber());
-				*/
+						if (uv_accept(server, client) == 0)
+						{
+							uv_tcp_t* uv_tcp_client = client;
+							uv_os_sock_t uv_os_client = uv_tcp_client->socket;
+
+							if (GetXOwner()->AttachTcpSocket(uv_os_client, uv_tcp_client))
+							{
+								return uv_os_client;
+							}
+						}
+						client.Close();
+						return invalid_socket;
+					};
+
+					if (((reqx != nullptr)) && (reqx->type == uv_exclude_listen))
+					{
+						if (reqx->last_status == 0)
+						{
+							while (reqx->queue_count > 0)
+							{
+								reqx->queue_count--;
+								uv_os_sock_t sock_client = _accept_stub(server);
+
+								if (sock_client != invalid_socket)
+								{
+									return sock_client;
+								}
+							}
+							// no client coming
+							// wait for listen_callback wake up me
+							reqx->task = this;
+							SwitchToFiber(GetXOwner()->GetFiber());
+							reqx->task = nullptr;
+							if (reqx->last_status == 0)
+							{
+								reqx->queue_count--;
+								assert(reqx->queue_count == 0);
+								uv_os_sock_t sock_client = _accept_stub(server);
+
+								if (sock_client != invalid_socket)
+								{
+									return sock_client;
+								}
+							}
+						}
+					}
+				}
+				return invalid_socket;
 			}
 		private:
 			FIBER_T m_fiber;
 			Routine m_routine;
 			IXScheduler* m_owner;
-
-			union
-			{
-				struct
-				{
-					int status;
-				}conn_data;
-				struct
-				{
-					int status;
-				}send_data;
-				struct
-				{
-					char* buf;
-					int buf_size;
-
-					int status;
-				}recv_data;
-			}m_cur_data;
 		};
 
 		class CXScheduler : public IXScheduler
@@ -390,11 +589,9 @@ namespace libco
 				}
 				assert(m_fiber != nullptr);
 
-				size_t uv_size = uv_loop_size();
-				assert(uv_size > 0);
-				m_loop_context = (uv_loop_t*)malloc(uv_size);
-				assert(m_loop_context != nullptr);
-				memset(m_loop_context, 0x00, uv_size);
+				size_t loop_size = uv_loop_size();
+				assert(loop_size > 0);
+				m_loop_context = MemAlloc<uv_loop_t>(loop_size);
 				int errcode = uv_loop_init(m_loop_context);
 				assert(errcode == 0);
 				m_loop_context->data = dynamic_cast<IXScheduler*>(this);
@@ -407,7 +604,7 @@ namespace libco
 				{
 					Peek();
 				} while (uv_loop_close(m_loop_context) == UV_EBUSY);
-				free(m_loop_context);
+				MemFree(m_loop_context);
 				m_loop_context = nullptr;
 
 				if (!m_was_converted)
@@ -424,16 +621,23 @@ namespace libco
 		public:
 			virtual bool Peek() override
 			{
-				return (uv_run(m_loop_context, UV_RUN_NOWAIT) == 0);
+				return (uv_run(GetLoopContext(), UV_RUN_NOWAIT) == 0);
 			}
 			virtual bool NewTask(Routine func) override
 			{
 				if (IXTask* task = CXTask::Create(this, func))
 				{
-					CXHandle Handle(m_loop_context, UV_TIMER);
+					CXHandle Handle(GetLoopContext(), UV_TIMER);
 
 					Handle.SetXTask(task);
-					if (uv_timer_start(Handle, _task_execute, 0, 0) == 0)
+					int errcode = uv_timer_start(Handle, [](uv_timer_t* handle) {
+						CXHandle Handle(handle);
+						IXTask* task = Handle.GetXTask();
+
+						Handle.Close();
+						SwitchToFiber(task->GetFiber());
+					}, 0, 0);
+					if (errcode == 0)
 					{
 						return true;
 					}
@@ -447,99 +651,74 @@ namespace libco
 				CXHandle Handle(task->GetXOwner()->GetLoopContext(), UV_TIMER);
 
 				Handle.SetXTask(task);
-				if (uv_timer_start(Handle, _task_finished, 0, 0) != 0)
+				int errcode = uv_timer_start(Handle, [](uv_timer_t* handle) {
+					CXHandle Handle(handle);
+					IXTask* task = Handle.GetXTask();
+
+					Handle.Close();
+					task->Delete();
+				}, 0, 0);
+				if (errcode != 0)
 				{
 					throw std::runtime_error("Free task error");
 				}
 			}
-		protected:
-			static void _task_execute(uv_timer_t* handle)
-			{
-				CXHandle Handle(handle);
-				IXTask* task = Handle.GetXTask();
-
-				Handle.Close();
-				SwitchToFiber(task->GetFiber());
-			}
-			static void _task_finished(uv_timer_t* handle)
-			{
-				CXHandle Handle(handle);
-				IXTask* task = Handle.GetXTask();
-
-				Handle.Close();
-				task->Delete();
-			}
 		public: // socket
-			virtual uv_os_sock_t CreateSocket(int af, int type, int protocol) override
+			virtual uv_os_sock_t CreateTcpSocket(int af) override
 			{
-				uv_os_sock_t sock = ::socket(af, type, protocol);
+				uv_os_sock_t sock = ::socket(af, SOCK_STREAM, IPPROTO_TCP);
 
-				if (sock == invalid_socket)
-					return sock;
-
-				if (type == SOCK_STREAM)
+				if (sock != invalid_socket)
 				{
-					CXHandle handle(m_loop_context, UV_TCP);
-
-					if (uv_tcp_open(handle, sock) == 0)
+					if (AttachTcpSocket(sock))
 					{
-						m_tcp_table[sock] = handle;
 						return sock;
 					}
-					handle.Close();
+					::closesocket(sock);
 				}
-				else if (type == SOCK_DGRAM)
-				{
-					CXHandle handle(m_loop_context, UV_UDP);
-
-					if (uv_udp_open(handle, sock) == 0)
-					{
-						m_tcp_table[sock] = handle;
-						return sock;
-					}
-					handle.Close();
-				}
-				::closesocket(sock);
 				return invalid_socket;
 			}
-			virtual int DeleteSocket(uv_os_sock_t s) override
+			virtual bool AttachTcpSocket(uv_os_sock_t s, uv_tcp_t* uv_handle = nullptr) override
 			{
-				uv_tcp_t* tcp_handle;
-				uv_udp_t* udp_handle;
+				if (QueryTcpSocket(s) == nullptr)
+				{
+					if (uv_handle != nullptr)
+					{
+						m_tcp_table[s] = uv_handle;
+						return true;
+					}
+					else
+					{
+						CXHandle handle(GetLoopContext(), UV_TCP);
 
-				if (QuerySocket(s, tcp_handle))
+						if (uv_tcp_open(handle, s) == 0)
+						{
+							m_tcp_table[s] = handle;
+							return true;
+						}
+						handle.Close();
+					}
+				}
+				return false;
+			}
+			virtual bool DetachTcpSocket(uv_os_sock_t s) override
+			{
+				if (uv_tcp_t* tcp_handle = QueryTcpSocket(s))
 				{
 					m_tcp_table.erase(s);
 					CXHandle(tcp_handle).Close();
-					return 0;
-				}
-				else if (QuerySocket(s, udp_handle))
-				{
-					m_udp_table.erase(s);
-					CXHandle(udp_handle).Close();
-					return 0;
-				}
-				return -1;
-			}
-			virtual bool QuerySocket(uv_os_sock_t s, uv_tcp_t*& handle) override
-			{
-				auto iter = m_tcp_table.find(s);
-				if (iter != m_tcp_table.end())
-				{
-					handle = iter->second;
 					return true;
 				}
 				return false;
 			}
-			virtual bool QuerySocket(uv_os_sock_t s, uv_udp_t*& handle) override
+			virtual uv_tcp_t* QueryTcpSocket(uv_os_sock_t s) override
 			{
-				auto iter = m_udp_table.find(s);
-				if (iter != m_udp_table.end())
+				auto tcp_iter = m_tcp_table.find(s);
+				if (tcp_iter != m_tcp_table.end())
 				{
-					handle = iter->second;
-					return true;
+					return tcp_iter->second;
 				}
-				return false;
+				return nullptr;
 			}
 		private:
 			FIBER_T m_fiber;
@@ -547,7 +726,6 @@ namespace libco
 			uv_loop_t* m_loop_context;
 
 			std::unordered_map<uv_os_sock_t, uv_tcp_t*> m_tcp_table;
-			std::unordered_map<uv_os_sock_t, uv_udp_t*> m_udp_table;
 		};
 	} // namespace impl
 
